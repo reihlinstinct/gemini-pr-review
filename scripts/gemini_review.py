@@ -5,6 +5,11 @@ Posts one COMMENT review on the pull request that triggered the workflow.
 Never approves, never requests changes, never merges. Idempotent per head
 SHA: a run that finds its own marker for the current head skips posting.
 
+Head binding: the diff is fetched for the exact event head SHA (compare
+API, base...head), and before posting the script re-reads the PR and
+skips if the head moved while the review was being generated. The posted
+review always names the SHA it actually reviewed.
+
 Every external failure (GitHub API, Gemini API, quota exhausted) becomes a
 note in the step summary instead of a failed check: this review is advisory
 and must never block CI. Missing configuration (environment) does fail the
@@ -58,11 +63,14 @@ class Note(Exception):
 
 
 def _http(url, token=None, method="GET", payload=None,
-          accept="application/vnd.github+json", timeout=60, log_url=None):
+          accept="application/vnd.github+json", timeout=60, log_url=None,
+          extra_headers=None):
     """One HTTP call. Returns raw response bytes. Raises Note on any failure."""
     headers = {"Accept": accept, "User-Agent": "gemini-pr-review-action"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if extra_headers:
+        headers.update(extra_headers)
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
@@ -87,14 +95,17 @@ def _github_json(path, token, method="GET", payload=None):
         raise Note(f"bad JSON from {path}: {exc}") from exc
 
 
-def fetch_pr_title(repo, number, token):
-    pr = _github_json(f"/repos/{repo}/pulls/{number}", token)
-    return pr.get("title", "")
+def fetch_pr(repo, number, token):
+    return _github_json(f"/repos/{repo}/pulls/{number}", token)
 
 
-def fetch_diff_capped(repo, number, token, max_chars=MAX_DIFF_CHARS):
-    raw = _http(f"{GITHUB_API}/repos/{repo}/pulls/{number}", token=token,
-                accept="application/vnd.github.v3.diff")
+def fetch_diff_capped(repo, base_sha, head_sha, token, max_chars=MAX_DIFF_CHARS):
+    # Diff is fetched for the exact event head SHA via the compare API, so a
+    # force-push or a newer commit cannot swap the reviewed content after the
+    # run started. The pulls/{n}.diff endpoint always serves the live head
+    # and is deliberately not used.
+    raw = _http(f"{GITHUB_API}/repos/{repo}/compare/{base_sha}...{head_sha}",
+                token=token, accept="application/vnd.github.v3.diff")
     diff = raw.decode("utf-8", "replace")
     if len(diff) <= max_chars:
         return diff, False
@@ -109,7 +120,12 @@ def already_reviewed(repo, number, token, head_sha):
     reviews = _github_json(
         f"/repos/{repo}/pulls/{number}/reviews?per_page=100", token)
     tag = f"<!-- {MARKER} sha={head_sha} "
-    return any(tag in (r.get("body") or "") for r in reviews)
+    # Marker counts only from the bot identity this Action posts as; a
+    # human-authored comment quoting the marker must not suppress a review.
+    return any(
+        tag in (r.get("body") or "")
+        and (r.get("user") or {}).get("login") == "github-actions[bot]"
+        for r in reviews)
 
 
 def post_comment_review(repo, number, token, body):
@@ -118,15 +134,17 @@ def post_comment_review(repo, number, token, body):
 
 
 def gemini_review_text(api_key, prompt, model=MODEL):
-    url = f"{GEMINI_API}/{model}:generateContent?key={api_key}"
-    log_url = f"{GEMINI_API}/{model}:generateContent?key=<redacted>"
+    # Key travels in the x-goog-api-key header, never in the URL: query
+    # strings leak into logs, proxies and error messages.
+    url = f"{GEMINI_API}/{model}:generateContent"
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1500},
     }
     raw = _http(url, method="POST", payload=payload,
-                accept="application/json", log_url=log_url)
+                accept="application/json",
+                extra_headers={"x-goog-api-key": api_key})
     try:
         data = json.loads(raw.decode("utf-8"))
         parts = data["candidates"][0]["content"]["parts"]
@@ -172,8 +190,12 @@ def run(repo, number, head_sha, token, api_key):
     if already_reviewed(repo, number, token, head_sha):
         note(f"head {head_sha[:8]} already reviewed; skipping")
         return 0
-    title = fetch_pr_title(repo, number, token)
-    diff, truncated = fetch_diff_capped(repo, number, token)
+    pr = fetch_pr(repo, number, token)
+    title = pr.get("title", "")
+    base_sha = (pr.get("base") or {}).get("sha")
+    if not base_sha:
+        raise Note("PR base SHA unavailable; skipping")
+    diff, truncated = fetch_diff_capped(repo, base_sha, head_sha, token)
     if not diff.strip():
         note("empty diff; skipping")
         return 0
@@ -181,6 +203,16 @@ def run(repo, number, head_sha, token, api_key):
         repo=repo, number=number, title=title,
         truncated=", capped" if truncated else "", diff=diff)
     text = gemini_review_text(api_key, prompt)
+    # Head-binding re-check: the event SHA this review names must still be
+    # the PR's head before posting. The caller's concurrency group cancels
+    # superseded runs, but this check is the last line against posting a
+    # review whose marker names a stale head.
+    current = (fetch_pr(repo, number, token).get("head") or {}).get("sha")
+    if current != head_sha:
+        short = current[:8] if current else "unknown"
+        note(f"head moved to {short} while reviewing; "
+             f"not posting for {head_sha[:8]}")
+        return 0
     body = format_body(text, head_sha, truncated)
     post_comment_review(repo, number, token, body)
     note(f"posted COMMENT review on PR #{number} at head {head_sha[:8]}")
@@ -197,6 +229,15 @@ def main():
     except KeyError as exc:
         print(f"::error::missing required environment variable {exc}")
         return 1
+    # Privacy gate: PR diffs leave GitHub for the Gemini API, and the
+    # shared free-tier key's terms allow Google to use submitted content.
+    # Public repositories only; refuse anything else, including a missing
+    # or unreadable visibility flag (fail closed).
+    private = os.environ.get("REPO_PRIVATE")
+    if private != "false":
+        note(f"repository visibility is not public "
+             f"({private or 'unknown'}); refusing to send diffs to Gemini")
+        return 0
     try:
         return run(repo, number, head_sha, token, api_key)
     except Note as exc:

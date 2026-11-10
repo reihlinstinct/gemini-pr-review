@@ -17,8 +17,20 @@ permissions:
   contents: read
   pull-requests: write
 
+# One run per PR at a time, newest head wins: a push to the PR cancels the
+# in-flight run for the older head, so a stale-head review cannot be posted
+# after a newer one is on its way. The script also re-checks the head before
+# posting (see scripts/gemini_review.py "Head binding").
+concurrency:
+  group: gemini-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   gemini-review:
+    # Public repositories only: PR diffs are sent to the Gemini API under a
+    # free-tier key, and private content must never leave GitHub. The script
+    # fails closed on the same check (REPO_PRIVATE) in case this is edited.
+    if: ${{ github.event.repository.private == false }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -36,6 +48,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           REPO: ${{ github.repository }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MODEL: gemini-2.5-flash

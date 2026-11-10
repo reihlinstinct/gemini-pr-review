@@ -20,8 +20,11 @@ import gemini_review as gr  # noqa: E402
 REPO = "reihlinstinct/example"
 NUMBER = 7
 SHA = "a" * 40
+BASE = "b" * 40
 TOKEN = "gh-token"
 KEY = "gemini-key"
+
+PR_PAYLOAD = {"title": "Add x", "base": {"sha": BASE}, "head": {"sha": SHA}}
 
 
 def fake_response(payload):
@@ -45,6 +48,7 @@ class GrTestBase(unittest.TestCase):
     def setUp(self):
         self.env_patch = mock.patch.dict(os.environ, {
             "REPO": REPO,
+            "REPO_PRIVATE": "false",
             "PR_NUMBER": str(NUMBER),
             "HEAD_SHA": SHA,
             "GH_TOKEN": TOKEN,
@@ -77,7 +81,7 @@ class TestRouting(GrTestBase):
     def test_posts_comment_review_on_new_head(self):
         routes = {
             ("GET", "/reviews?"): [],
-            ("GET", f"/pulls/{NUMBER}"): {"title": "Add x"},
+            ("GET", f"/pulls/{NUMBER}"): PR_PAYLOAD,
             ("POST", "generateContent"): {
                 "candidates": [{"content": {"parts": [{"text": "Looks fine."}]}}]},
             ("POST", "/reviews"): {"id": 1},
@@ -97,17 +101,63 @@ class TestRouting(GrTestBase):
     def test_skips_when_head_already_reviewed(self):
         routes = {
             ("GET", "/reviews?"): [
-                {"body": f"x <!-- gemini-action-review sha={SHA} model=m -->"}],
+                {"body": f"x <!-- gemini-action-review sha={SHA} model=m -->",
+                 "user": {"login": "github-actions[bot]"}}],
         }
         with mock.patch("urllib.request.urlopen", self._urlopen(routes)):
             self.assertEqual(gr.main(), 0)
         self.assertEqual(len(self.posted), 1)  # only the reviews listing
 
+    def test_marker_from_other_author_does_not_skip(self):
+        routes = {
+            ("GET", "/reviews?"): [
+                {"body": f"x <!-- gemini-action-review sha={SHA} model=m -->",
+                 "user": {"login": "some-human"}}],
+            ("GET", f"/pulls/{NUMBER}"): PR_PAYLOAD,
+            ("POST", "generateContent"): {
+                "candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
+            ("POST", "/reviews"): {"id": 1},
+        }
+        with mock.patch("urllib.request.urlopen", self._urlopen(
+                routes, diff=b"diff --git a/x b/x\n+line\n")):
+            self.assertEqual(gr.main(), 0)
+        posts = [d for m, u, d in self.posted if m == "POST" and "/reviews" in u]
+        self.assertEqual(len(posts), 1)  # human-quoted marker must not suppress
+
+    def test_refuses_non_public_repo(self):
+        def _opener(req, timeout=None):
+            raise AssertionError(f"no HTTP allowed on private repo: {req.full_url}")
+
+        with mock.patch.dict(os.environ, {"REPO_PRIVATE": "true"}):
+            with mock.patch("urllib.request.urlopen", _opener):
+                self.assertEqual(gr.main(), 0)  # refuse, but never fail CI
+
+    def test_missing_visibility_flag_refuses(self):
+        env = {k: v for k, v in os.environ.items() if k != "REPO_PRIVATE"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch("urllib.request.urlopen") as u:
+                self.assertEqual(gr.main(), 0)
+        u.assert_not_called()
+
+    def test_gemini_key_in_header_not_url(self):
+        seen = {}
+
+        def _opener(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["key"] = req.get_header("X-goog-api-key")
+            return fake_response({"candidates": [{"content": {
+                "parts": [{"text": "ok"}]}}]})
+
+        with mock.patch("urllib.request.urlopen", _opener):
+            gr.gemini_review_text(KEY, "prompt")
+        self.assertEqual(seen["key"], KEY)
+        self.assertNotIn("key=", seen["url"])
+
     def test_truncates_long_diff(self):
         long_diff = ("diff --git a/x b/x\n" + "+padline\n" * 4000)
         routes = {
             ("GET", "/reviews?"): [],
-            ("GET", f"/pulls/{NUMBER}"): {"title": "Big"},
+            ("GET", f"/pulls/{NUMBER}"): dict(PR_PAYLOAD, title="Big"),
             ("POST", "generateContent"): {
                 "candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
             ("POST", "/reviews"): {"id": 1},
@@ -127,7 +177,7 @@ class TestRouting(GrTestBase):
     def test_quota_error_is_a_note_not_failure(self):
         routes = {
             ("GET", "/reviews?"): [],
-            ("GET", f"/pulls/{NUMBER}"): {"title": "Add x"},
+            ("GET", f"/pulls/{NUMBER}"): PR_PAYLOAD,
             ("POST", "generateContent"): http_error(429, b'{"error":"quota"}'),
         }
         with mock.patch("urllib.request.urlopen", self._urlopen(
@@ -135,6 +185,31 @@ class TestRouting(GrTestBase):
             self.assertEqual(gr.main(), 0)  # graceful skip, never a failed check
         posts = [d for m, u, d in self.posted if m == "POST" and "/reviews" in u]
         self.assertEqual(posts, [])
+
+    def test_skips_posting_when_head_moved_mid_review(self):
+        moved = dict(PR_PAYLOAD, head={"sha": "c" * 40})
+        pr_calls = []
+
+        def _opener(req, timeout=None):
+            self.posted.append((req.get_method(), req.full_url,
+                                req.data and json.loads(req.data.decode())))
+            if "diff" in req.headers.get("Accept", ""):
+                return fake_response(b"diff --git a/x b/x\n+line\n")
+            if req.get_method() == "GET" and "/reviews?" in req.full_url:
+                return fake_response([])
+            if req.get_method() == "GET" and f"/pulls/{NUMBER}" in req.full_url:
+                pr_calls.append(1)
+                return fake_response(PR_PAYLOAD if len(pr_calls) == 1 else moved)
+            if "generateContent" in req.full_url:
+                return fake_response({"candidates": [{"content": {
+                    "parts": [{"text": "Looks fine."}]}}]})
+            raise AssertionError(f"unexpected call: {req.get_method()} {req.full_url}")
+
+        with mock.patch("urllib.request.urlopen", _opener):
+            self.assertEqual(gr.main(), 0)
+        posts = [d for m, u, d in self.posted if m == "POST" and "/reviews" in u]
+        self.assertEqual(posts, [])  # head moved: nothing posted for stale SHA
+        self.assertEqual(len(pr_calls), 2)  # head re-checked before posting
 
     def test_github_failure_is_a_note_not_failure(self):
         routes = {
@@ -162,8 +237,21 @@ class TestHelpers(unittest.TestCase):
     def test_fetch_diff_capped_short(self):
         with mock.patch("urllib.request.urlopen",
                         return_value=fake_response(b"small diff")):
-            diff, truncated = gr.fetch_diff_capped(REPO, NUMBER, TOKEN)
+            diff, truncated = gr.fetch_diff_capped(REPO, BASE, SHA, TOKEN)
         self.assertEqual((diff, truncated), ("small diff", False))
+
+    def test_fetch_diff_uses_event_head_sha(self):
+        seen = []
+
+        def _opener(req, timeout=None):
+            seen.append(req.full_url)
+            return fake_response(b"diff")
+
+        with mock.patch("urllib.request.urlopen", _opener):
+            gr.fetch_diff_capped(REPO, BASE, SHA, TOKEN)
+        self.assertEqual(len(seen), 1)
+        self.assertIn(f"/compare/{BASE}...{SHA}", seen[0])
+        self.assertNotIn(f"/pulls/{NUMBER}", seen[0])
 
     def test_gemini_empty_response_is_note(self):
         empty = {"candidates": [{"content": {"parts": []}}]}
