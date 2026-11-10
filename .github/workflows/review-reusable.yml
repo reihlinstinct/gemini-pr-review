@@ -28,7 +28,7 @@ jobs:
           repository: reihlinstinct/gemini-pr-review
           # Self-pin: updated by a follow-up commit after every script change
           # (see README.md "Pinning").
-          ref: main
+          ref: 770f8e5f474e5683d7f58807123ca1788541f61c
           path: .gemini-action
           persist-credentials: false
       - name: Review the pull request with Gemini
