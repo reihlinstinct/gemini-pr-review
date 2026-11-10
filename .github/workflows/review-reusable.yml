@@ -1,0 +1,42 @@
+name: Gemini PR review (reusable)
+
+# Reusable workflow called by each consuming repo's thin caller
+# (see README.md). Runs only on the caller's pull_request event; the caller
+# guards to same-repo PRs, so fork code never sees the token or the secret.
+# Permissions are the whole point: contents: read + pull-requests: write,
+# nothing else. The script posts COMMENT reviews only - never APPROVE,
+# never REQUEST_CHANGES, never a merge.
+
+on:
+  workflow_call:
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gemini-review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the pinned review script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: reihlinstinct/gemini-pr-review
+          # Self-pin: updated by a follow-up commit after every script change
+          # (see README.md "Pinning").
+          ref: main
+          path: .gemini-action
+          persist-credentials: false
+      - name: Review the pull request with Gemini
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MODEL: gemini-2.5-flash
+        run: python3 .gemini-action/scripts/gemini_review.py
