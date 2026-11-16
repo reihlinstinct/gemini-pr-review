@@ -1,0 +1,55 @@
+name: Gemini PR review (reusable)
+
+# Reusable workflow called by each consuming repo's thin caller
+# (see README.md). Runs only on the caller's pull_request event; the caller
+# guards to same-repo PRs, so fork code never sees the token or the secret.
+# Permissions are the whole point: contents: read + pull-requests: write,
+# nothing else. The script posts COMMENT reviews only - never APPROVE,
+# never REQUEST_CHANGES, never a merge.
+
+on:
+  workflow_call:
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# One run per PR at a time, newest head wins: a push to the PR cancels the
+# in-flight run for the older head, so a stale-head review cannot be posted
+# after a newer one is on its way. The script also re-checks the head before
+# posting (see scripts/gemini_review.py "Head binding").
+concurrency:
+  group: gemini-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gemini-review:
+    # Public repositories only: PR diffs are sent to the Gemini API under a
+    # free-tier key, and private content must never leave GitHub. The script
+    # fails closed on the same check (REPO_PRIVATE) in case this is edited.
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the pinned review script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: reihlinstinct/gemini-pr-review
+          # Self-pin: updated by a follow-up commit after every script change
+          # (see README.md "Pinning").
+          ref: 096c60ebb5cf0c663b71bf6725bceabcc19de3f1
+          path: .gemini-action
+          persist-credentials: false
+      - name: Review the pull request with Gemini
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REPO: ${{ github.repository }}
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MODEL: gemini-2.5-flash
+        run: python3 .gemini-action/scripts/gemini_review.py
