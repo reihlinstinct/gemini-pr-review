@@ -23,7 +23,7 @@ permissions:
 # posting (see scripts/gemini_review.py "Head binding").
 concurrency:
   group: gemini-review-${{ github.repository }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gemini-review:
